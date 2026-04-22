@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import '../data/database.dart';
 import '../models/restaurant.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -188,7 +189,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   try {
-    const String apiKey = 'AIzaSyD0-jEMg-OxcEXgXd2QASX2wR7N7YdRaV8';
+    final String apiKey = dotenv.env['GOOGLE_API_KEY'] ?? '';
     final adresa = Uri.parse('https://places.googleapis.com/v1/places:searchNearby');
     double radiusMetry = vybranaVzdalenost * 1000;
 
