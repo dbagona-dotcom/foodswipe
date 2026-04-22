@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import '../data/database.dart';
 import '../models/restaurant.dart';
 
@@ -69,16 +70,99 @@ class _HomeScreenState extends State<HomeScreen> {
     await pamet.setStringList('seznam_oblibenych', oblibeneRestauraceIds);
   }
 
+  // ── NOVÁ FUNKCE: Kontrola internetu ──────────────────────────────────────
+  Future<bool> _zkontrolujInternet() async {
+    final connectivity = await Connectivity().checkConnectivity();
+    final jePripojeny = connectivity.contains(ConnectivityResult.mobile) ||
+        connectivity.contains(ConnectivityResult.wifi) ||
+        connectivity.contains(ConnectivityResult.ethernet);
+
+    if (!jePripojeny && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: const Color(0xFF1E1E1E),
+          duration: const Duration(seconds: 4),
+          content: const Row(
+            children: [
+              Text('📡', style: TextStyle(fontSize: 20)),
+              SizedBox(width: 10),
+              Text(
+                'Nejsi připojený k internetu',
+                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          action: SnackBarAction(
+            label: 'OK',
+            textColor: const Color(0xFFFF6B6B),
+            onPressed: () {},
+          ),
+        ),
+      );
+      return false;
+    }
+    return true;
+  }
+
+  // ── NOVÁ FUNKCE: Dialog pro vypnutou GPS ─────────────────────────────────
+  Future<void> _zobrazGpsDialog() async {
+    if (mojePoloha != null) return;
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text(
+          '📍 Poloha vypnutá',
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
+        content: const Text(
+          'FoodSwipe potřebuje znát tvoji polohu aby našel restaurace v tvém okolí. Povol prosím přístup k poloze v nastavení.',
+          style: TextStyle(color: Colors.grey),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Zrušit', style: TextStyle(color: Colors.grey)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFFF6B6B),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            onPressed: () {
+              Navigator.pop(context);
+              Geolocator.openLocationSettings();
+            },
+            child: const Text('Otevřít nastavení', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _ziskejPolohu() async {
     bool sluzbaZapnuta = await Geolocator.isLocationServiceEnabled();
-    if (!sluzbaZapnuta) return;
+    if (!sluzbaZapnuta) {
+      await _zobrazGpsDialog(); // ── GPS dialog pokud je služba vypnutá
+      return;
+    }
 
     LocationPermission opravneni = await Geolocator.checkPermission();
     if (opravneni == LocationPermission.denied) {
       opravneni = await Geolocator.requestPermission();
-      if (opravneni == LocationPermission.denied) return;
+      if (opravneni == LocationPermission.denied) {
+        await _zobrazGpsDialog(); // ── GPS dialog pokud zamítl oprávnění
+        return;
+      }
     }
-    if (opravneni == LocationPermission.deniedForever) return;
+    if (opravneni == LocationPermission.deniedForever) {
+      await _zobrazGpsDialog(); // ── GPS dialog pokud zamítl natrvalo
+      return;
+    }
 
     Position poloha = await Geolocator.getCurrentPosition();
     setState(() {
@@ -88,22 +172,47 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _stahniDataZeServeru() async {
-    await _ziskejPolohu();
+  final maPripojeni = await _zkontrolujInternet();
+  if (!maPripojeni) {
+    setState(() { nacitamData = false; });
+    return;
+  }
 
-    if (mojePoloha == null) {
-      debugPrint('🔥 CHYBA: Nepodařilo se získat polohu.');
-      vyfiltrujKarty('vse');
-      setState(() { nacitamData = false; });
-      return;
-    }
+  await _ziskejPolohu();
 
-    try {
-      const String apiKey = 'AIzaSyD0-jEMg-OxcEXgXd2QASX2wR7N7YdRaV8';
-      final adresa = Uri.parse('https://places.googleapis.com/v1/places:searchNearby');
-      double radiusMetry = vybranaVzdalenost * 1000;
+  if (mojePoloha == null) {
+    debugPrint('🔥 CHYBA: Nepodařilo se získat polohu.');
+    vyfiltrujKarty('vse');
+    setState(() { nacitamData = false; });
+    return;
+  }
 
-      final body = jsonEncode({
-        "includedTypes": ["restaurant", "fast_food_restaurant", "cafe", "pizza_restaurant"],
+  try {
+    const String apiKey = 'AIzaSyD0-jEMg-OxcEXgXd2QASX2wR7N7YdRaV8';
+    final adresa = Uri.parse('https://places.googleapis.com/v1/places:searchNearby');
+    double radiusMetry = vybranaVzdalenost * 1000;
+
+    // Rozdělíme typy do dvou skupin pro 2 paralelní requesty = až 40 výsledků
+    final skupiny = [
+      ["restaurant", "fast_food_restaurant", "cafe", "pizza_restaurant",
+       "hamburger_restaurant", "chinese_restaurant", "italian_restaurant"],
+      ["vegan_restaurant", "vegetarian_restaurant", "japanese_restaurant",
+       "american_restaurant", "sandwich_shop", "bakery",
+       "ramen_restaurant", "korean_restaurant", "mexican_restaurant"],
+    ];
+
+    final hlavicky = {
+      'Content-Type': 'application/json',
+      'X-Goog-Api-Key': apiKey,
+      'X-Goog-FieldMask': 'places.id,places.displayName.text,places.primaryType,places.location,places.photos,places.rating,places.priceLevel'
+    };
+
+    // Spustíme oba requesty paralelně
+    final futures = skupiny.map((typy) => http.post(
+      adresa,
+      headers: hlavicky,
+      body: jsonEncode({
+        "includedTypes": typy,
         "maxResultCount": 20,
         "locationRestriction": {
           "circle": {
@@ -114,442 +223,93 @@ class _HomeScreenState extends State<HomeScreen> {
             "radius": radiusMetry
           }
         }
-      });
+      }),
+    ).timeout(const Duration(seconds: 10)));
 
-      final odpoved = await http.post(
-        adresa,
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Goog-Api-Key': apiKey,
-          'X-Goog-FieldMask': 'places.id,places.displayName.text,places.primaryType,places.location,places.photos,places.rating,places.priceLevel'
-        },
-        body: body,
-      ).timeout(const Duration(seconds: 15));
+    final odpovedi = await Future.wait(futures);
 
-      if (odpoved.statusCode == 200) {
-        final data = jsonDecode(odpoved.body);
-        final places = data['places'] as List?;
+    List<Restaurant> stazeneRestaurace = [];
+    Set<String> pouzitaId = {}; // deduplikace
 
-        if (places != null) {
-          List<Restaurant> stazeneRestaurace = [];
+    for (var odpoved in odpovedi) {
+      if (odpoved.statusCode != 200) continue;
 
-          for (var place in places) {
-            String type = place['primaryType'] ?? 'restaurant';
+      final data = jsonDecode(odpoved.body);
+      final places = data['places'] as List?;
+      if (places == null) continue;
 
-            // Filtrování nežádoucích typů
-            final List<String> zakazaneTypy = [
-              'hotel', 'lodging', 'bed_and_breakfast', 'shopping_mall',
-              'supermarket', 'grocery_store', 'convenience_store',
-              'gas_station', 'pharmacy', 'beauty_salon', 'spa',
-              'car_wash', 'parking', 'bank', 'atm', 'clothing_store',
-              'department_store', 'furniture_store', 'electronics_store',
-              'home_goods_store', 'pet_store', 'florist', 'gym', 'library',
-            ];
-            if (zakazaneTypy.contains(type)) continue;
+      for (var place in places) {
+        String type = place['primaryType'] ?? 'restaurant';
 
-            String name = place['displayName']['text'];
-            double? rating = place['rating'] != null ? (place['rating'] as num).toDouble() : null;
-
-            String? cenaKc;
-            if (place['priceLevel'] == 'PRICE_LEVEL_INEXPENSIVE') cenaKc = 'Do 200 Kč';
-            else if (place['priceLevel'] == 'PRICE_LEVEL_MODERATE') cenaKc = '200 - 400 Kč';
-            else if (place['priceLevel'] == 'PRICE_LEVEL_EXPENSIVE') cenaKc = '400 - 700 Kč';
-            else if (place['priceLevel'] == 'PRICE_LEVEL_VERY_EXPENSIVE') cenaKc = 'Nad 700 Kč';
-
-            String imageUrl = "https://images.unsplash.com/photo-1513639776629-7b61b0ac49cb?q=80&w=1080";
-            if (place['photos'] != null && place['photos'].isNotEmpty) {
-              String photoName = place['photos'][0]['name'];
-              imageUrl = 'https://places.googleapis.com/v1/$photoName/media?key=$apiKey&maxHeightPx=1080&maxWidthPx=1080';
-            }
-
-            // Mapování tagu podle typu a názvu
-            String nameLower = name.toLowerCase();
-            String typeLower = type.toLowerCase();
-            String nasTag = 'klasika';
-
-            // FASTFOOD
-            if (typeLower.contains('fast_food') ||
-                nameLower.contains('mcdonald') ||
-                nameLower.contains('mac donald') ||
-                nameLower.contains('kfc') ||
-                nameLower.contains('burger king') ||
-                nameLower.contains('subway') ||
-                nameLower.contains('taco bell') ||
-                nameLower.contains('wendy') ||
-                nameLower.contains('popeyes') ||
-                nameLower.contains('five guys') ||
-                nameLower.contains('domino') ||
-                nameLower.contains('papa john') ||
-                nameLower.contains('chipotle') ||
-                nameLower.contains('panda express') ||
-                nameLower.contains('arby') ||
-                nameLower.contains('kebab') ||
-                nameLower.contains('kebap') ||
-                nameLower.contains('döner') ||
-                nameLower.contains('doner') ||
-                nameLower.contains('gyros') ||
-                nameLower.contains('shawarma') ||
-                nameLower.contains('shawurma') ||
-                nameLower.contains('lahmacun') ||
-                nameLower.contains('falafel') ||
-                nameLower.contains('pita') ||
-                nameLower.contains('wrap') ||
-                nameLower.contains('hot dog') ||
-                nameLower.contains('hotdog') ||
-                nameLower.contains('párek') ||
-                nameLower.contains('friterie') ||
-                nameLower.contains('frytárna') ||
-                nameLower.contains('snack') ||
-                nameLower.contains('občerstvení') ||
-                nameLower.contains('rychlé jídlo') ||
-                nameLower.contains('bufet') ||
-                nameLower.contains('jídelna') ||
-                nameLower.contains('kantýna') ||
-                nameLower.contains('stánek') ||
-                nameLower.contains('okénko') ||
-                nameLower.contains('street food') ||
-                nameLower.contains('food truck') ||
-                nameLower.contains('take away') ||
-                nameLower.contains('takeaway') ||
-                nameLower.contains('express')) {
-              nasTag = 'fastfood';
-            }
-
-            // BURGER
-            else if (typeLower.contains('hamburger') ||
-                nameLower.contains('burger') ||
-                nameLower.contains('burgers') ||
-                nameLower.contains('smash') ||
-                nameLower.contains('smashburger') ||
-                nameLower.contains('hamburger') ||
-                nameLower.contains('hamburgr') ||
-                nameLower.contains('cheeseburger') ||
-                nameLower.contains('bbq burger') ||
-                nameLower.contains('gourmet burger') ||
-                nameLower.contains('craft burger') ||
-                nameLower.contains('patty') ||
-                nameLower.contains('& bun') ||
-                nameLower.contains('bun &')) {
-              nasTag = 'burger';
-            }
-
-            // KAVÁRNA
-            else if (typeLower.contains('cafe') ||
-                typeLower.contains('coffee') ||
-                typeLower.contains('bakery') ||
-                typeLower.contains('dessert') ||
-                typeLower.contains('ice_cream') ||
-                typeLower.contains('tea') ||
-                nameLower.contains('café') ||
-                nameLower.contains('cafe') ||
-                nameLower.contains('caffe') ||
-                nameLower.contains('caffè') ||
-                nameLower.contains('caffé') ||
-                nameLower.contains('kafe') ||
-                nameLower.contains('kavárna') ||
-                nameLower.contains('kaviareň') ||
-                nameLower.contains('coffee') ||
-                nameLower.contains('espresso') ||
-                nameLower.contains('cappuccino') ||
-                nameLower.contains('latte') ||
-                nameLower.contains('barista') ||
-                nameLower.contains('roastery') ||
-                nameLower.contains('pražírna') ||
-                nameLower.contains('starbucks') ||
-                nameLower.contains('costa coffee') ||
-                nameLower.contains('croissant') ||
-                nameLower.contains('pekárna') ||
-                nameLower.contains('pekáreň') ||
-                nameLower.contains('cukrárna') ||
-                nameLower.contains('cukráreň') ||
-                nameLower.contains('zákusky') ||
-                nameLower.contains('dorty') ||
-                nameLower.contains('patisserie') ||
-                nameLower.contains('pâtisserie') ||
-                nameLower.contains('boulangerie') ||
-                nameLower.contains('waffle') ||
-                nameLower.contains('wafl') ||
-                nameLower.contains('palačinka') ||
-                nameLower.contains('crepe') ||
-                nameLower.contains('crêpe') ||
-                nameLower.contains('pancake') ||
-                nameLower.contains('zmrzlina') ||
-                nameLower.contains('gelato') ||
-                nameLower.contains('gelateria') ||
-                nameLower.contains('ice cream') ||
-                nameLower.contains('frozen yogurt') ||
-                nameLower.contains('bubble tea') ||
-                nameLower.contains('boba') ||
-                nameLower.contains('milkshake') ||
-                nameLower.contains('čajovna') ||
-                nameLower.contains('tearoom') ||
-                nameLower.contains('čaj')) {
-              nasTag = 'kavarna';
-            }
-
-            // PIZZA
-            else if (typeLower.contains('pizza') ||
-                nameLower.contains('pizza') ||
-                nameLower.contains('pizzeria') ||
-                nameLower.contains('pizzéria') ||
-                nameLower.contains('pizzerie') ||
-                nameLower.contains('calzone') ||
-                nameLower.contains('focaccia') ||
-                nameLower.contains('neapolitan') ||
-                nameLower.contains('margherita') ||
-                nameLower.contains('diavola') ||
-                nameLower.contains('wood fire') ||
-                nameLower.contains('woodfire') ||
-                nameLower.contains('kamenná pec')) {
-              nasTag = 'pizza';
-            }
-
-            // ČÍNA / ASIE
-            else if (typeLower.contains('chinese') ||
-                typeLower.contains('asian') ||
-                typeLower.contains('japanese') ||
-                typeLower.contains('vietnamese') ||
-                typeLower.contains('thai') ||
-                typeLower.contains('korean') ||
-                typeLower.contains('ramen') ||
-                typeLower.contains('sushi') ||
-                typeLower.contains('noodle') ||
-                nameLower.contains('chinese') ||
-                nameLower.contains('china') ||
-                nameLower.contains('čína') ||
-                nameLower.contains('číňan') ||
-                nameLower.contains('čínská') ||
-                nameLower.contains('dim sum') ||
-                nameLower.contains('dumpling') ||
-                nameLower.contains('jiaozi') ||
-                nameLower.contains('baozi') ||
-                nameLower.contains('peking') ||
-                nameLower.contains('szechuan') ||
-                nameLower.contains('sichuan') ||
-                nameLower.contains('wonton') ||
-                nameLower.contains('chow mein') ||
-                nameLower.contains('wok') ||
-                nameLower.contains('vietnam') ||
-                nameLower.contains('viet') ||
-                nameLower.contains('pho') ||
-                nameLower.contains('phở') ||
-                nameLower.contains('bun bo') ||
-                nameLower.contains('bún bò') ||
-                nameLower.contains('banh mi') ||
-                nameLower.contains('bánh mì') ||
-                nameLower.contains('spring roll') ||
-                nameLower.contains('japan') ||
-                nameLower.contains('japonsk') ||
-                nameLower.contains('sushi') ||
-                nameLower.contains('sashimi') ||
-                nameLower.contains('ramen') ||
-                nameLower.contains('udon') ||
-                nameLower.contains('soba') ||
-                nameLower.contains('tempura') ||
-                nameLower.contains('teriyaki') ||
-                nameLower.contains('yakitori') ||
-                nameLower.contains('tonkatsu') ||
-                nameLower.contains('gyoza') ||
-                nameLower.contains('miso') ||
-                nameLower.contains('matcha') ||
-                nameLower.contains('onigiri') ||
-                nameLower.contains('bento') ||
-                nameLower.contains('izakaya') ||
-                nameLower.contains('teppanyaki') ||
-                nameLower.contains('korean') ||
-                nameLower.contains('korea') ||
-                nameLower.contains('korejsk') ||
-                nameLower.contains('kimchi') ||
-                nameLower.contains('bibimbap') ||
-                nameLower.contains('bulgogi') ||
-                nameLower.contains('kbbq') ||
-                nameLower.contains('thai') ||
-                nameLower.contains('thajsk') ||
-                nameLower.contains('pad thai') ||
-                nameLower.contains('tom yum') ||
-                nameLower.contains('green curry') ||
-                nameLower.contains('asia') ||
-                nameLower.contains('asian') ||
-                nameLower.contains('orient') ||
-                nameLower.contains('noodle') ||
-                nameLower.contains('nudle') ||
-                nameLower.contains('nudl') ||
-                nameLower.contains('ni hao') ||
-                nameLower.contains('pan asian') ||
-                nameLower.contains('pan-asian') ||
-                nameLower.contains('india') ||
-                nameLower.contains('indick') ||
-                nameLower.contains('curry') ||
-                nameLower.contains('tikka') ||
-                nameLower.contains('masala') ||
-                nameLower.contains('tandoor') ||
-                nameLower.contains('biryani') ||
-                nameLower.contains('naan') ||
-                nameLower.contains('samosa') ||
-                nameLower.contains('pakista')) {
-              nasTag = 'cina';
-            }
-
-            // ITÁLIE
-            else if (typeLower.contains('italian') ||
-                nameLower.contains('italian') ||
-                nameLower.contains('italiano') ||
-                nameLower.contains('italiana') ||
-                nameLower.contains('italská') ||
-                nameLower.contains('italske') ||
-                nameLower.contains('italia') ||
-                nameLower.contains('italy') ||
-                nameLower.contains('ristorante') ||
-                nameLower.contains('trattoria') ||
-                nameLower.contains('osteria') ||
-                nameLower.contains('enoteca') ||
-                nameLower.contains('locanda') ||
-                nameLower.contains('taverna') ||
-                nameLower.contains('pasta') ||
-                nameLower.contains('spaghetti') ||
-                nameLower.contains('fettuccine') ||
-                nameLower.contains('tagliatelle') ||
-                nameLower.contains('pappardelle') ||
-                nameLower.contains('linguine') ||
-                nameLower.contains('penne') ||
-                nameLower.contains('rigatoni') ||
-                nameLower.contains('gnocchi') ||
-                nameLower.contains('risotto') ||
-                nameLower.contains('carbonara') ||
-                nameLower.contains('lasagna') ||
-                nameLower.contains('lasagne') ||
-                nameLower.contains('ravioli') ||
-                nameLower.contains('tortellini') ||
-                nameLower.contains('ossobuco') ||
-                nameLower.contains('tiramisu') ||
-                nameLower.contains('tiramisù') ||
-                nameLower.contains('bruschetta') ||
-                nameLower.contains('antipasto') ||
-                nameLower.contains('prosciutto') ||
-                nameLower.contains('mozzarella') ||
-                nameLower.contains('parmigiano') ||
-                nameLower.contains('arancini') ||
-                nameLower.contains('minestrone') ||
-                nameLower.contains('bolognese') ||
-                nameLower.contains('amatriciana') ||
-                nameLower.contains('milano') ||
-                nameLower.contains('napoli') ||
-                nameLower.contains('venezia') ||
-                nameLower.contains('toscana') ||
-                nameLower.contains('sicilia')) {
-              nasTag = 'italie';
-            }
-
-            // ZDRAVÉ
-            else if (typeLower.contains('vegan') ||
-                typeLower.contains('vegetarian') ||
-                typeLower.contains('salad') ||
-                typeLower.contains('health') ||
-                typeLower.contains('organic') ||
-                nameLower.contains('vegan') ||
-                nameLower.contains('vegán') ||
-                nameLower.contains('vegansk') ||
-                nameLower.contains('vegetarian') ||
-                nameLower.contains('vegetariánsk') ||
-                nameLower.contains('plant based') ||
-                nameLower.contains('plant-based') ||
-                nameLower.contains('raw food') ||
-                nameLower.contains('gluten free') ||
-                nameLower.contains('gluten-free') ||
-                nameLower.contains('bez lepku') ||
-                nameLower.contains('bio ') ||
-                nameLower.contains('organic') ||
-                nameLower.contains('zdravě') ||
-                nameLower.contains('zdravá') ||
-                nameLower.contains('zdravé') ||
-                nameLower.contains('poke') ||
-                nameLower.contains('bowl') ||
-                nameLower.contains('salát') ||
-                nameLower.contains('salad') ||
-                nameLower.contains('smoothie') ||
-                nameLower.contains('detox') ||
-                nameLower.contains('fresh') ||
-                nameLower.contains('fitness') ||
-                nameLower.contains('low carb') ||
-                nameLower.contains('keto') ||
-                nameLower.contains('protein') ||
-                nameLower.contains('superfood') ||
-                nameLower.contains('acai') ||
-                nameLower.contains('açaí') ||
-                nameLower.contains('granola') ||
-                nameLower.contains('avocado') ||
-                nameLower.contains('avokádo') ||
-                nameLower.contains('hummus') ||
-                nameLower.contains('quinoa') ||
-                nameLower.contains('tofu') ||
-                nameLower.contains('tempeh') ||
-                nameLower.contains('green ') ||
-                nameLower.contains('zelená') ||
-                nameLower.contains('zelenina') ||
-                nameLower.contains('zeleninový')) {
-              nasTag = 'zdrave';
-            }
-
-            // KLASIKA – vše ostatní + explicitně česká kuchyně
-            else {
-              if (typeLower.contains('czech') ||
-                  typeLower.contains('european') ||
-                  typeLower.contains('steakhouse') ||
-                  nameLower.contains('restaurace') ||
-                  nameLower.contains('hospoda') ||
-                  nameLower.contains('hostinec') ||
-                  nameLower.contains('pivnice') ||
-                  nameLower.contains('šenk') ||
-                  nameLower.contains('krčma') ||
-                  nameLower.contains('česká') ||
-                  nameLower.contains('moravsk') ||
-                  nameLower.contains('svíčková') ||
-                  nameLower.contains('guláš') ||
-                  nameLower.contains('řízek') ||
-                  nameLower.contains('knedlík') ||
-                  nameLower.contains('bramborák') ||
-                  nameLower.contains('grill') ||
-                  nameLower.contains('steakhouse') ||
-                  nameLower.contains('steak') ||
-                  nameLower.contains('žebírka') ||
-                  nameLower.contains('zvěřina') ||
-                  nameLower.contains('schnitzel') ||
-                  nameLower.contains('wiener') ||
-                  nameLower.contains('brasserie')) {
-                nasTag = 'klasika';
-              }
-            }
-
-            stazeneRestaurace.add(
-              Restaurant(
-                id: place['id'].toString(),
-                name: name,
-                type: type.replaceAll('_', ' '),
-                tag: nasTag,
-                img: imageUrl,
-                lat: place['location']['latitude'],
-                lon: place['location']['longitude'],
-                rating: rating,
-                price: cenaKc,
-              )
-            );
-          }
-
-          if (stazeneRestaurace.isNotEmpty) {
-            databaze = stazeneRestaurace;
-          }
+        // Filtr nežádoucích typů
+        if (type == 'hotel' || type == 'lodging' || type == 'bed_and_breakfast' ||
+            type == 'shopping_mall' || type == 'department_store' ||
+            type == 'supermarket' || type == 'grocery_store' ||
+            type == 'food_court' || type == 'convenience_store') {
+          continue;
         }
-        vyfiltrujKarty(aktualniKategorie);
-      } else {
-        throw Exception('Chybový kód od Googlu: ${odpoved.statusCode}\nOdpověď: ${odpoved.body}');
+
+        String placeId = place['id'].toString();
+        if (pouzitaId.contains(placeId)) continue; // přeskočit duplicity
+        pouzitaId.add(placeId);
+
+        String name = place['displayName']['text'];
+        double? rating = place['rating'] != null ? (place['rating'] as num).toDouble() : null;
+
+        String? cenaKc;
+        if (place['priceLevel'] == 'PRICE_LEVEL_INEXPENSIVE') cenaKc = 'Do 200 Kč';
+        else if (place['priceLevel'] == 'PRICE_LEVEL_MODERATE') cenaKc = '200 - 400 Kč';
+        else if (place['priceLevel'] == 'PRICE_LEVEL_EXPENSIVE') cenaKc = '400 - 700 Kč';
+        else if (place['priceLevel'] == 'PRICE_LEVEL_VERY_EXPENSIVE') cenaKc = 'Nad 700 Kč';
+
+        String imageUrl = "https://images.unsplash.com/photo-1513639776629-7b61b0ac49cb?q=80&w=1080";
+        if (place['photos'] != null && place['photos'].isNotEmpty) {
+          String photoName = place['photos'][0]['name'];
+          imageUrl = 'https://places.googleapis.com/v1/$photoName/media?key=$apiKey&maxHeightPx=1080&maxWidthPx=1080';
+        }
+
+        String nameLower = name.toLowerCase();
+        String typeLower = type.toLowerCase();
+        String nasTag = 'klasika';
+
+        if (typeLower.contains('fast_food') || nameLower.contains('mcdonald') || nameLower.contains('kfc') || nameLower.contains('kebab')) nasTag = 'fastfood';
+        else if (typeLower.contains('hamburger') || nameLower.contains('burger')) nasTag = 'burger';
+        else if (typeLower.contains('cafe') || nameLower.contains('caffe') || nameLower.contains('kavárna') || nameLower.contains('coffee') || nameLower.contains('espresso')) nasTag = 'kavarna';
+        else if (typeLower.contains('pizza') || nameLower.contains('pizza')) nasTag = 'pizza';
+        else if (typeLower.contains('chinese') || typeLower.contains('asian') || typeLower.contains('korean') || typeLower.contains('japanese') || typeLower.contains('ramen') || nameLower.contains('wok') || nameLower.contains('sushi') || nameLower.contains('asia')) nasTag = 'cina';
+        else if (typeLower.contains('italian') || nameLower.contains('pasta') || nameLower.contains('risotto')) nasTag = 'italie';
+        else if (typeLower.contains('vegan') || typeLower.contains('vegetarian') || nameLower.contains('poke') || nameLower.contains('salat')) nasTag = 'zdrave';
+
+        stazeneRestaurace.add(
+          Restaurant(
+            id: placeId,
+            name: name,
+            type: type.replaceAll('_', ' '),
+            tag: nasTag,
+            img: imageUrl,
+            lat: place['location']['latitude'],
+            lon: place['location']['longitude'],
+            rating: rating,
+            price: cenaKc,
+          )
+        );
       }
-    } catch (chyba) {
-      debugPrint('🔥 CHYBA PŘI STAHOVÁNÍ DAT: $chyba');
-      vyfiltrujKarty('vse');
-    } finally {
-      setState(() { nacitamData = false; });
     }
+
+    debugPrint('✅ Celkem načteno restaurací: ${stazeneRestaurace.length}');
+
+    if (stazeneRestaurace.isNotEmpty) {
+      databaze = stazeneRestaurace;
+    }
+
+    vyfiltrujKarty(aktualniKategorie);
+  } catch (chyba) {
+    debugPrint('🔥 CHYBA PŘI STAHOVÁNÍ DAT: $chyba');
+    vyfiltrujKarty('vse');
+  } finally {
+    setState(() { nacitamData = false; });
   }
+}
 
   void vyfiltrujKarty(String vybranyTag) {
     setState(() {
@@ -611,10 +371,28 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _vypocitejViteze() {
-    var viteznyTag = skore.entries.reduce((a, b) => a.value > b.value ? a : b).key;
-    var viteznyNazev = kategorie.firstWhere((k) => k['tag'] == viteznyTag)['nazev'];
-    return viteznyNazev ?? 'Neznámé';
+  // Zkontroluj jestli uživatel vůbec něco swajpnul
+  int celkemSwipe = skore.values.fold(0, (suma, hodnota) => suma + hodnota);
+  
+  if (celkemSwipe <= 0) {
+    return 'Zkus swajpovat 😄';
   }
+
+  // Najdi kategorii s nejvyšším skóre
+  var viteznyVstup = skore.entries.reduce((a, b) => a.value > b.value ? a : b);
+  
+  // Pokud je skóre záporné nebo nulové, nic nedoporučuj
+  if (viteznyVstup.value <= 0) {
+    return 'Těžký výběr 🤷';
+  }
+
+  var viteznyNazev = kategorie.firstWhere(
+    (k) => k['tag'] == viteznyVstup.key,
+    orElse: () => {'nazev': 'Neznámé'},
+  )['nazev'];
+  
+  return viteznyNazev ?? 'Neznámé';
+}
 
   void _zobrazOblibeneOkno() {
     showModalBottomSheet(

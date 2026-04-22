@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'screens/home_screen.dart';
 
 // Hlavní spouštěcí funkce programu
-void main() {
+void main() async {
+  await dotenv.load(fileName: ".env");
   runApp(const FoodSwipeApp());
 }
 
@@ -14,7 +16,7 @@ class FoodSwipeApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'FoodSwipe 🔥',
-      debugShowCheckedModeBanner: false, // Skryje nápis "DEBUG" vpravo nahoře
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
         scaffoldBackgroundColor: const Color(0xFF121212),
@@ -24,12 +26,12 @@ class FoodSwipeApp extends StatelessWidget {
           secondary: Color(0xFFFF6B6B),
         ),
         appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFF121212), // Sjednoceno s pozadím pro čistý design
+          backgroundColor: Color(0xFF121212),
           elevation: 0,
           centerTitle: true,
         ),
       ),
-      home: const HomeScreen(), // Spustí rovnou naši hlavní obrazovku
+      home: const HomeScreen(),
     );
   }
 }
